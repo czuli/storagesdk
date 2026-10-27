@@ -1,0 +1,61 @@
+---
+title: Buddy Artifacts
+eyebrow: Adapters
+description: Buddy Artifacts adapter for storagesdk — artifact versions as the live tree, snapshots and forks.
+section: adapters
+---
+
+## Overview
+
+[Buddy Artifacts](https://buddy.works/docs/api/artifacts) are versioned file buckets attached to a Buddy workspace or project. This adapter maps one artifact to one storage location: the live tree is a single artifact version, and every snapshot or fork is another version of the same artifact, created with Buddy's server-side version copy.
+
+## Configuration
+
+```ts
+import { Storage } from '@storagesdk/core';
+import { buddy } from '@storagesdk/adapters/buddy';
+
+const storage = new Storage({
+  adapter: buddy({
+    workspace: 'my-team',
+    artifact: 'photos',
+    token: process.env.BUDDY_TOKEN!,
+  }),
+});
+```
+
+```ts
+buddy({
+  workspace: string;   // workspace domain (app.buddy.works/<workspace>)
+  artifact: string;    // artifact hash id or identifier (must already exist)
+  token: string;       // personal access token with artifact management scope
+  project?: string;    // project name, to resolve a project-scoped identifier
+  version?: string;    // version that holds the live tree; defaults to 'live'
+  apiUrl?: string;     // defaults to https://api.buddy.works; EU: https://api.eu.buddy.works
+  retry?: { maxAttempts?: number; baseMs?: number; maxDelayMs?: number };
+  copy?: { pollMs?: number; stepMs?: number; maxPollMs?: number; timeoutMs?: number };
+});
+```
+
+Create a bucket-type artifact in the Buddy app or via the REST API and point the adapter at it. The live version is created on first use. Tokens come from **My ID → Personal access tokens** and need the artifact scope on the workspace.
+
+## Notes
+
+- Snapshots and forks are server-side copies of the live version. Buddy performs the copy in the background and the adapter polls until it has landed (several seconds per copy; a fork made without `fromSnapshot` costs two copies).
+- The API allows 3000 requests per hour per token, reads included. `429` and `502`–`504` are retried with exponential backoff honouring `Retry-After`; `retry` tunes this.
+- `list()` costs one request per directory and `delete()` two (the parent is listed so the adapter never deletes a directory by mistake). Buddy keeps a directory after its last file is removed, so the adapter deletes the directory with its last file; two concurrent deletes of the last two files in one directory can leave an empty directory behind.
+- Buddy serves no per-file content type, mtime or user metadata: `contentType` is always `application/octet-stream`, `lastModified` is the epoch and `etag` is the file's `sha256:` checksum.
+- Ranged downloads are emulated client-side; `copy()` and `move()` download and re-upload; `url()` returns the token-protected REST download endpoint and `uploadUrl()` throws `NotSupported`.
+- `storage.raw` exposes the authenticated REST client plus the resolved workspace, artifact and version names.
+
+## Compatibility
+
+| Capability | Support |
+| --- | --- |
+| Uploads | Multipart upload through the REST API |
+| Copy / move | Download and re-upload |
+| Snapshots | Server-side version copy |
+| Forks | Server-side version copy |
+| Byte-range reads | Emulated client-side |
+| User metadata | Not persisted |
+| Signed URLs | Token-protected REST endpoint only |

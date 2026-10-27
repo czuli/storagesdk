@@ -65,6 +65,7 @@ await fork.upload('hello.txt', 'mutated in fork only');
 | Railway | [`@storagesdk/adapters/railway`](./packages/adapters/src/railway/README.md) | [Railway Buckets](https://docs.railway.com/storage-buckets) — branded alias of the Tigris adapter. |
 | Neon | [`@storagesdk/adapters/neon`](./packages/adapters/src/neon/README.md) | [Neon Object Storage](https://neon.com/docs/storage/overview) — S3-compatible storage isolated per database branch. |
 | Mosaic | [`@storagesdk/adapters/mosaic`](./packages/adapters/src/mosaic/README.md) | [Mosaic Object Storage](https://storage.mosaicos.com) — S3-compatible object storage with self-serve signup. |
+| Buddy | [`@storagesdk/adapters/buddy`](./packages/adapters/src/buddy/README.md) | [Buddy Artifacts](https://buddy.works/docs/api/artifacts) — artifact versions; snapshots and forks are server-side version copies. |
 | Filesystem | [`@storagesdk/adapters/fs`](./packages/adapters/src/fs/README.md) | Local `node:fs/promises`. For development and tests. |
 
 For the full, up-to-date list see **[storagesdk.dev/adapters](https://storagesdk.dev/adapters)**.

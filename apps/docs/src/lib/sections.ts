@@ -140,6 +140,11 @@ export const SECTIONS: Record<SectionId, Section> = {
               href: '/adapters/mosaic',
             },
             {
+              id: 'buddy',
+              label: 'Buddy Artifacts',
+              href: '/adapters/buddy',
+            },
+            {
               id: 'supabase',
               label: 'Supabase Storage',
               href: '/adapters/supabase',

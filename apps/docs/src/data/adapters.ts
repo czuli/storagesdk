@@ -106,6 +106,12 @@ export const ADAPTERS: AdapterEntry[] = [
     sub: '@storagesdk/adapters/mosaic',
   },
   {
+    name: 'Buddy Artifacts',
+    short: 'Buddy',
+    key: 'buddy',
+    sub: '@storagesdk/adapters/buddy',
+  },
+  {
     name: 'Supabase Storage',
     short: 'Supabase',
     key: 'supabase',
