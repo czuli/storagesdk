@@ -100,6 +100,10 @@
       "types": "./dist/mosaic/index.d.ts",
       "default": "./dist/mosaic/index.js"
     },
+    "./buddy": {
+      "types": "./dist/buddy/index.d.ts",
+      "default": "./dist/buddy/index.js"
+    },
     "./test-suite": {
       "types": "./dist/test-suite.d.ts",
       "default": "./dist/test-suite.js"
@@ -137,6 +141,7 @@
     "minio",
     "tigris",
     "tensorlake",
+    "buddy",
     "fly",
     "railway",
     "azure",

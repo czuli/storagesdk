@@ -2,6 +2,7 @@ import type { Adapter } from '@storagesdk/core/adapter';
 import { ARCHIL_ENV_VARS, archilConfigFromEnv } from './archil/env.js';
 import { AZURE_ENV_VARS, azureConfigFromEnv } from './azure/env.js';
 import { BACKBLAZE_ENV_VARS, backblazeConfigFromEnv } from './backblaze/env.js';
+import { BUDDY_ENV_VARS, buddyConfigFromEnv } from './buddy/env.js';
 import {
   CODE_STORAGE_ENV_VARS,
   codeStorageConfigFromEnv,
@@ -57,6 +58,7 @@ export const ADAPTERS = [
   'railway',
   'neon',
   'mosaic',
+  'buddy',
 ] as const;
 
 export type AdapterName = (typeof ADAPTERS)[number];
@@ -97,6 +99,7 @@ const ENV_VARS: Record<AdapterName, readonly AdapterEnvVar[]> = {
   fly: FLY_ENV_VARS,
   railway: RAILWAY_ENV_VARS,
   mosaic: MOSAIC_ENV_VARS,
+  buddy: BUDDY_ENV_VARS,
 };
 
 const CONFIG_BUILDERS: Record<AdapterName, () => unknown> = {
@@ -123,6 +126,7 @@ const CONFIG_BUILDERS: Record<AdapterName, () => unknown> = {
   fly: flyConfigFromEnv,
   railway: railwayConfigFromEnv,
   mosaic: mosaicConfigFromEnv,
+  buddy: buddyConfigFromEnv,
 };
 
 /**
@@ -204,5 +208,7 @@ async function loadAdapterFactory(
       return (await import('./railway/index.js')).railway as never;
     case 'mosaic':
       return (await import('./mosaic/index.js')).mosaic as never;
+    case 'buddy':
+      return (await import('./buddy/index.js')).buddy as never;
   }
 }
