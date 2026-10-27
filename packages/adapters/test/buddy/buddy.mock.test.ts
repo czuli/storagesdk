@@ -903,6 +903,46 @@ describe('buddy adapter unit', () => {
       expect(await adapter.forks.list()).toEqual([]);
     });
 
+    it('snapshots.delete refuses ids outside the manifest, so live is safe', async () => {
+      const adapter = adapterFactory();
+      await adapter.upload('a.txt', 'a');
+      await expect(adapter.snapshots.delete('live')).rejects.toMatchObject({
+        code: 'NotFound',
+      });
+      await expect(adapter.snapshots.delete('nope')).rejects.toMatchObject({
+        code: 'NotFound',
+      });
+      expect(versionNames()).toEqual(['live']);
+      expect((await adapter.list()).items.map((i) => i.path)).toEqual([
+        'a.txt',
+      ]);
+    });
+
+    it('reading an unknown fork or snapshot fails with NotFound and creates nothing', async () => {
+      const adapter = adapterFactory();
+      await adapter.upload('a.txt', 'a');
+      await expect(adapter.forks.get('nope').list()).rejects.toMatchObject({
+        code: 'NotFound',
+      });
+      await expect(
+        adapter.forks.get('nope').upload('b.txt', 'b')
+      ).rejects.toMatchObject({ code: 'NotFound' });
+      await expect(adapter.snapshots.get('nope').list()).rejects.toMatchObject({
+        code: 'NotFound',
+      });
+      await adapter.forks.create({ name: 'f1' });
+      await expect(
+        adapter.forks.get('f1').snapshots.get('nope').list()
+      ).rejects.toMatchObject({ code: 'NotFound' });
+      // Core snapshots the live tree before every fork, so exactly one
+      // snapshot version is expected next to the fork; nothing else appeared.
+      const names = versionNames();
+      expect(names).toHaveLength(3);
+      expect(names).toContain('live');
+      expect(names).toContain('live-fork-f1');
+      expect(names.some((n) => n.startsWith('live-snapshot-'))).toBe(true);
+    });
+
     it('snapshot views are read-only', async () => {
       const adapter = adapterFactory();
       await adapter.upload('a.txt', 'a');

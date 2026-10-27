@@ -167,7 +167,7 @@ export function buddy(config: BuddyConfig): Adapter<BuddyRaw> {
     artifactId: undefined,
     versionIds: new Map(),
   };
-  return defineAdapter(impl(ctx, config.version ?? DEFAULT_VERSION, true));
+  return defineAdapter(impl(ctx, config.version ?? DEFAULT_VERSION, 'live'));
 }
 
 /** Strip the leading slash Buddy puts on every listed path. */
@@ -463,19 +463,24 @@ async function copyVersion(
 }
 
 /**
- * Raw implementation over one artifact version. `writable` is true for the
- * live tree and forks; snapshot views get `false` and expose reads only.
+ * How a version view behaves. Only the live tree creates its version on
+ * first use; fork and snapshot views must already exist (`NotFound`
+ * otherwise), and snapshot views reject writes.
  */
+type ViewMode = 'live' | 'fork' | 'snapshot';
+
+/** Raw implementation over one artifact version, in the given view mode. */
 function impl(
   ctx: Context,
   version: string,
-  writable: boolean
+  mode: ViewMode
 ): Adapter<BuddyRaw> {
   const { client, config } = ctx;
+  const writable = mode !== 'snapshot';
 
   const versionId = (signal?: AbortSignal): Promise<string> =>
     resolveVersionId(ctx, version, {
-      create: writable,
+      create: mode === 'live',
       ...(signal ? { signal } : {}),
     });
 
@@ -772,20 +777,20 @@ function impl(
       async delete(id, opts): Promise<void> {
         checkSignal(opts?.signal);
         const meta = await readManifest(adapter);
+        // Only versions this location recorded as snapshots may go: every
+        // other version name (including the live tree) is off limits.
+        if (!meta.snapshots.some((s) => s.id === id)) {
+          throw new StorageError({
+            code: 'NotFound',
+            message: `snapshot ${id} not found`,
+          });
+        }
         meta.snapshots = meta.snapshots.filter((s) => s.id !== id);
         await deleteVersionIfPresent(ctx, id, opts?.signal);
         await writeManifest(adapter, meta);
       },
 
-      get(id): ReadOnlyAdapter {
-        const view = impl(ctx, id, false);
-        return {
-          download: (p, opts) => view.download(p, opts),
-          head: (p, opts) => view.head(p, opts),
-          list: (opts) => view.list(opts),
-          url: (p, opts) => view.url(p, opts),
-        };
-      },
+      get: (id): ReadOnlyAdapter => snapshotView(ctx, id),
     },
 
     forks: {
@@ -815,7 +820,7 @@ function impl(
           opts.onProgress?.({ copied: 1, total: 1 });
           // The copy carries the parent's manifest; replace it with the
           // fork's own (empty, pointing back at the parent).
-          const forkImpl = impl(ctx, forkVersion, true);
+          const forkImpl = impl(ctx, forkVersion, 'fork');
           const forkManifest: Manifest = emptyManifest({
             location: version,
             snapshotId: opts.fromSnapshot ?? null,
@@ -899,9 +904,21 @@ function impl(
   return adapter;
 }
 
+/** Read-only view over an existing snapshot version. */
+function snapshotView(ctx: Context, id: string): ReadOnlyAdapter {
+  const view = impl(ctx, id, 'snapshot');
+  return {
+    download: (p, opts) => view.download(p, opts),
+    head: (p, opts) => view.head(p, opts),
+    list: (opts) => view.list(opts),
+    url: (p, opts) => view.url(p, opts),
+  };
+}
+
 /**
- * Adapter whose version name is still being computed (fork names may need
- * hashing). Every method awaits the name once, then delegates.
+ * Adapter over a fork whose version name is still being computed (fork
+ * names may need hashing). Every method awaits the name once, then
+ * delegates. The fork version must already exist: nothing here creates one.
  */
 function lazyImpl(
   ctx: Context,
@@ -909,7 +926,7 @@ function lazyImpl(
 ): Adapter<BuddyRaw> {
   let resolved: Promise<Adapter<BuddyRaw>> | undefined;
   const target = (): Promise<Adapter<BuddyRaw>> => {
-    resolved ??= versionName.then((name) => impl(ctx, name, true));
+    resolved ??= versionName.then((name) => impl(ctx, name, 'fork'));
     return resolved;
   };
   const raw: BuddyRaw = {
@@ -935,11 +952,7 @@ function lazyImpl(
       list: async () => (await target()).snapshots.list(),
       head: async (id, o) => (await target()).snapshots.head(id, o),
       delete: async (id, o) => (await target()).snapshots.delete(id, o),
-      get: (id) =>
-        lazyImpl(
-          ctx,
-          versionName.then(() => id)
-        ),
+      get: (id) => snapshotView(ctx, id),
     },
     forks: {
       create: async (o) => (await target()).forks.create(o),
