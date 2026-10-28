@@ -30,11 +30,11 @@ import { storageAdapterTestSuite } from '../../src/test-suite.js';
  * It models the behaviours the adapter is written around:
  *
  * - versions are addressed by hash id, listed with `page`/`per_page`;
- * - `POST /versions` with `from` answers at once with an empty version
- *   and fills it "in the background" (here: after `copyDelayMs`), bumping
- *   `created_date` when done;
+ * - `POST /versions` with `from` completes the copy before answering and
+ *   never bumps `created_date` afterwards;
  * - directory listings are one level deep, carry a leading slash on
  *   `path`, and a directory survives the deletion of its last file;
+ * - `GET .../content/<file>` answers with the file's own entry;
  * - `DELETE .../content/<path>` on a directory removes the whole subtree;
  * - 400 with a free-text message for missing paths / duplicate names.
  */
@@ -54,11 +54,6 @@ interface MockState {
   project: string;
   versions: Map<string, MockVersion>;
   counter: number;
-  copyDelayMs: number;
-  /** When set, copies never "finish" (created_date never changes). */
-  stallCopies: boolean;
-  /** When set, copies report the source size but never bump created_date. */
-  copyBySizeOnly: boolean;
   /** Pending status overrides: consumed per matching request. */
   failures: {
     match: (method: string, url: URL) => boolean;
@@ -82,9 +77,6 @@ const state: MockState = {
   project: 'mock-project',
   versions: new Map(),
   counter: 0,
-  copyDelayMs: 20,
-  stallCopies: false,
-  copyBySizeOnly: false,
   failures: [],
   networkFailures: [],
   hooks: {},
@@ -94,9 +86,6 @@ const state: MockState = {
 function resetState(): void {
   state.versions.clear();
   state.counter = 0;
-  state.copyDelayMs = 20;
-  state.stallCopies = false;
-  state.copyBySizeOnly = false;
   state.failures = [];
   state.networkFailures = [];
   state.hooks = {};
@@ -161,6 +150,20 @@ function allDirs(v: MockVersion): Set<string> {
 }
 
 function listDir(v: MockVersion, dir: string): BuddyEntry[] | undefined {
+  // `GET .../content/<file>` answers with the file's own entry.
+  const file = v.files.get(dir);
+  if (file) {
+    const slash = dir.lastIndexOf('/');
+    return [
+      {
+        type: 'FILE',
+        name: slash >= 0 ? dir.slice(slash + 1) : dir,
+        path: `/${dir}`,
+        size: file.byteLength,
+        checksum: checksum(file),
+      },
+    ];
+  }
   const dirs = allDirs(v);
   if (dir !== '' && !dirs.has(dir)) return undefined;
   const entries: BuddyEntry[] = [];
@@ -201,15 +204,6 @@ function deletePath(v: MockVersion, path: string): boolean {
     if (d === path || d.startsWith(`${path}/`)) v.dirs.delete(d);
   }
   return true;
-}
-
-function startCopy(target: MockVersion, source: MockVersion): void {
-  if (state.stallCopies) return;
-  setTimeout(() => {
-    target.files = new Map(source.files);
-    target.dirs = new Set(source.dirs);
-    if (!state.copyBySizeOnly) target.created_date = nowIso();
-  }, state.copyDelayMs);
 }
 
 const decodeSegment = (segment: string): string => decodeURIComponent(segment);
@@ -289,11 +283,10 @@ async function handle(
         id: `v${String(++state.counter).padStart(5, '0')}`,
         version: body.version,
         created_date: nowIso(),
-        files: new Map(),
-        dirs: new Set(),
+        files: new Map(source?.files),
+        dirs: new Set(source?.dirs),
       };
       state.versions.set(created.id, created);
-      if (source) startCopy(created, source);
       return jsonResponse(versionJson(created), 201);
     }
     return errorResponse(405, 'method not allowed');
@@ -402,7 +395,6 @@ afterAll(() => {
   vi.unstubAllGlobals();
 });
 
-const FAST_COPY = { pollMs: 10, stepMs: 5, maxPollMs: 30, timeoutMs: 5_000 };
 const NO_RETRY_WAIT = { baseMs: 1, maxDelayMs: 50 };
 
 const adapterFactory = () =>
@@ -411,7 +403,6 @@ const adapterFactory = () =>
     artifact: state.identifier,
     project: state.project,
     token: 'test-token',
-    copy: FAST_COPY,
     retry: NO_RETRY_WAIT,
   });
 
@@ -661,7 +652,6 @@ describe('buddy adapter unit', () => {
         workspace: 'w',
         artifact: state.identifier,
         token: 't',
-        copy: FAST_COPY,
         retry: { ...NO_RETRY_WAIT, maxAttempts: 3 },
       });
       await adapter.upload('a.txt', 'a');
@@ -757,67 +747,54 @@ describe('buddy adapter unit', () => {
     });
   });
 
-  describe('version copy polling', () => {
-    it('finishes on created_date change and grows the poll interval', async () => {
-      state.copyDelayMs = 60;
-      const adapter = buddy({
-        workspace: 'w',
-        artifact: state.identifier,
-        token: 't',
-        copy: { pollMs: 10, stepMs: 10, maxPollMs: 25, timeoutMs: 5_000 },
-      });
-      await adapter.upload('a.txt', 'a');
-      const snap = await adapter.snapshots.create();
-      // 10 + 20 + 25 + 25 ≥ 60 ms → at most 4 polls (plus the pre-copy GET of the source).
-      expect(calls('GET', /^art00001\/versions\/v\d+$/)).toBeLessThanOrEqual(5);
-      expect(versionNames()).toEqual(['live', snap.id]);
-      expect(
-        await adapter.snapshots
-          .get(snap.id)
-          .download('a.txt')
-          .then((i) => i.size)
-      ).toBe(1);
-    });
-
-    it('falls back to the size check when created_date never changes', async () => {
-      state.copyBySizeOnly = true;
-      state.copyDelayMs = 0;
+  describe('version copy', () => {
+    it('uses the copy as soon as POST answers, without polling the version', async () => {
       const adapter = adapterFactory();
       await adapter.upload('a.txt', 'abc');
+      state.calls = [];
       const snap = await adapter.snapshots.create();
-      // third poll compares sizes
-      expect(calls('GET', /^art00001\/versions\/v\d+$/)).toBe(4);
+      const fork = await adapter.forks.create({ name: 'f1' });
+      expect(calls('GET', /^art00001\/versions\/v\d+$/)).toBe(0);
+      // The fork without fromSnapshot snapshots live first: three copies.
+      expect(calls('POST', /^art00001\/versions$/)).toBe(3);
+      expect(versionNames()).toEqual(
+        ['live', 'live-fork-f1', snap.id, fork.fromSnapshot].sort()
+      );
       expect(
         await adapter.snapshots
           .get(snap.id)
           .download('a.txt')
           .then((i) => i.size)
       ).toBe(3);
+      expect(
+        new TextDecoder().decode(
+          (await adapter.forks.get(fork.name).download('a.txt')).body
+        )
+      ).toBe('abc');
     });
 
-    it('times out, reports Provider and removes the half-made version', async () => {
-      state.stallCopies = true;
-      const adapter = buddy({
-        workspace: 'w',
-        artifact: state.identifier,
-        token: 't',
-        copy: { pollMs: 5, stepMs: 0, maxPollMs: 5, timeoutMs: 40 },
-      });
+    it('removes the snapshot version when a step after the copy fails', async () => {
+      const adapter = adapterFactory();
       await adapter.upload('a.txt', 'a');
-      await expect(adapter.snapshots.create()).rejects.toMatchObject({
-        code: 'Provider',
-        message: /did not finish within 0s/,
+      state.failures.push({
+        match: (m, u) =>
+          m === 'GET' && u.pathname.endsWith('/.storagesdk.metadata.json'),
+        status: 400,
+        body: JSON.stringify({ errors: [{ message: 'boom' }] }),
+        times: 1,
       });
+      await expect(adapter.snapshots.create()).rejects.toBeInstanceOf(
+        StorageError
+      );
       expect(versionNames()).toEqual(['live']);
       expect(await adapter.snapshots.list()).toEqual([]);
     });
 
-    it('aborts a pending copy and cleans up', async () => {
-      state.stallCopies = true;
+    it('rejects an aborted signal before creating anything', async () => {
       const adapter = adapterFactory();
       await adapter.upload('a.txt', 'a');
       const controller = new AbortController();
-      setTimeout(() => controller.abort(), 15);
+      controller.abort();
       await expect(
         adapter.forks.create({ name: 'f1', signal: controller.signal })
       ).rejects.toMatchObject({ code: 'Aborted' });
@@ -835,9 +812,13 @@ describe('buddy adapter unit', () => {
       const live = liveVersion();
       expect([...(live?.files.keys() ?? [])]).toEqual(['a/keep.txt']);
       expect(allDirs(live as MockVersion)).toEqual(new Set(['a']));
-      // one listing of a/b, one DELETE of the directory, one listing of a
+      // file lookup, DELETE of the file, listing of a/b, DELETE of a/b,
+      // listing of a (not empty, so pruning stops)
+      expect(calls('DELETE', /content\/a\/b\/c\.txt$/)).toBe(1);
       expect(calls('DELETE', /content\/a\/b$/)).toBe(1);
       expect(calls('DELETE', /content\/a$/)).toBe(0);
+      expect(calls('GET', /content\/a\/b\/c\.txt$/)).toBe(1);
+      expect(calls('GET', /content\/a(\/b)?$/)).toBe(2);
 
       await adapter.delete('a/keep.txt');
       expect(allDirs(liveVersion() as MockVersion).size).toBe(0);
@@ -855,6 +836,35 @@ describe('buddy adapter unit', () => {
       expect(calls('DELETE', /content\/top\.txt$/)).toBe(1);
       expect(calls('DELETE', /content\/d$/)).toBe(0);
       expect([...(liveVersion()?.files.keys() ?? [])]).toEqual(['d/two.txt']);
+    });
+
+    it('never lists a directory to delete a root file', async () => {
+      const adapter = adapterFactory();
+      await adapter.upload('top.txt', 't');
+      state.calls = [];
+      await adapter.delete('top.txt');
+      expect(calls('GET', /content$/)).toBe(0);
+      expect(calls('GET', /content\/top\.txt$/)).toBe(1);
+      expect(calls('DELETE', /content\/top\.txt$/)).toBe(1);
+      expect(state.calls).toHaveLength(2);
+    });
+
+    it('keeps the delete when pruning cannot list the directory', async () => {
+      const adapter = adapterFactory();
+      await adapter.upload('p/only.txt', 'x');
+      state.failures.push({
+        match: (m, u) => m === 'GET' && /content\/p$/.test(u.pathname),
+        status: 400,
+        body: JSON.stringify({
+          errors: [
+            { message: 'File server error (code: null): something went wrong' },
+          ],
+        }),
+        times: 1,
+      });
+      await adapter.delete('p/only.txt');
+      expect(liveVersion()?.files.has('p/only.txt')).toBe(false);
+      expect(calls('GET', /^400 /)).toBe(1);
     });
 
     it('never issues DELETE for a directory path or a missing file', async () => {
@@ -885,21 +895,24 @@ describe('buddy adapter unit', () => {
       ).toBe('a');
     });
 
-    it('rolls back the fork version when the copy fails after creation', async () => {
-      state.stallCopies = true;
-      const adapter = buddy({
-        workspace: 'w',
-        artifact: state.identifier,
-        token: 't',
-        copy: { pollMs: 5, stepMs: 0, maxPollMs: 5, timeoutMs: 30 },
-      });
+    it('rolls back the fork version when a step after the copy fails', async () => {
+      const adapter = adapterFactory();
       await adapter.upload('a.txt', 'a');
-      const snap = await adapter.snapshots.create().catch(() => undefined);
-      expect(snap).toBeUndefined();
-      await expect(adapter.forks.create({ name: 'f1' })).rejects.toMatchObject({
-        code: 'Provider',
+      const snap = await adapter.snapshots.create();
+      // The fork's own manifest is the first upload after the copy.
+      state.failures.push({
+        match: (m, u) =>
+          m === 'POST' &&
+          u.pathname.includes('/content/upload/') &&
+          u.pathname.endsWith('/.storagesdk.metadata.json'),
+        status: 400,
+        body: JSON.stringify({ errors: [{ message: 'boom' }] }),
+        times: 1,
       });
-      expect(versionNames()).toEqual(['live']);
+      await expect(
+        adapter.forks.create({ name: 'f1', fromSnapshot: snap.id })
+      ).rejects.toBeInstanceOf(StorageError);
+      expect(versionNames()).toEqual(['live', snap.id]);
       expect(await adapter.forks.list()).toEqual([]);
     });
 

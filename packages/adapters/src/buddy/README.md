@@ -36,12 +36,6 @@ buddy({
     baseMs?: number;       // exponential backoff base; default 500
     maxDelayMs?: number;   // cap for one wait, also for Retry-After; default 30 000
   };
-  copy?: {             // polling for server-side version copies (snapshots, forks)
-    pollMs?: number;       // first wait; default 1000
-    stepMs?: number;       // growth per poll; default 500
-    maxPollMs?: number;    // longest wait between polls; default 3000
-    timeoutMs?: number;    // give up after; default 600 000
-  };
 })
 ```
 
@@ -68,21 +62,21 @@ BUDDY_API_URL=https://api.buddy.works # optional
 
 - The live tree is one artifact version. Snapshots and forks are further
   versions of the same artifact, made with Buddy's server-side version
-  copy (`POST /versions` with `from`). Buddy answers at once and fills the
-  copy in the background; the adapter polls the version until its
-  `created_date` changes (fallback: matching size), with the interval
-  growing from `copy.pollMs` to `copy.maxPollMs`.
+  copy (`POST /versions` with `from`). Buddy completes the copy before it
+  answers, so the new version is readable right away. The version's
+  reported `size` is filled in a few seconds later and is not relied on.
 - The SDK manifest is stored as `.storagesdk.metadata.json` at the root of
   each writable version and hidden from `list()`.
 - `list()` walks Buddy's one-level directory listings in path order and
   prunes subtrees outside the prefix or before the cursor. Every directory
   on the way costs one request.
-- `delete()` lists the parent directory first, because
+- `delete()` looks the path up first (`GET .../content/<path>`), because
   `DELETE .../content/<path>` on a directory removes the whole subtree and
-  the adapter must only ever name a file. When the file is the last entry,
-  the directory is deleted instead and emptied ancestors are pruned, since
-  Buddy keeps a directory after its last file is removed and every leftover
-  directory makes `list()` one request more expensive.
+  the adapter must only ever name a file. After the file is removed, emptied
+  ancestor directories are pruned, since Buddy keeps a directory after its
+  last file is removed and every leftover directory makes `list()` one
+  request more expensive. Pruning is best-effort: a failed listing leaves
+  the empty directory in place and the delete still succeeds.
 - `copy()` and `move()` download and re-upload: the API has no in-version
   object copy.
 
@@ -93,16 +87,17 @@ BUDDY_API_URL=https://api.buddy.works # optional
   `Retry-After` is honoured; a `Retry-After` longer than `retry.maxDelayMs`
   fails fast with a `Provider` error whose `cause.retryAfterMs` says how
   long Buddy asked for. Budget roughly: upload or download 1 request,
-  `delete` 2, `head` 1, `list` 1 per directory, snapshot 5–8 (copy of ~10 s),
-  fork from live 10–15 (the SDK snapshots live first, so two copies).
-- **Copy latency.** A version copy takes several seconds regardless of
-  size (about 8–10 s for a few MB in practice); a fork created without
-  `fromSnapshot` costs two copies.
-- **Concurrent deletes in one directory.** Two `delete()` calls racing on
+  `delete` 2 (plus one listing per directory level for nested paths and one
+  `DELETE` per emptied directory), `head` 1, `list` 1 per directory, snapshot 3, fork from a
+  snapshot 5, fork from live 8 (the SDK snapshots live first, so two
+  copies). The first call on a new adapter adds the artifact and version
+  lookups.
+- **Concurrent writes in one directory.** Two `delete()` calls racing on
   the last two files of a directory can each see the other file still
-  present, delete only their own file and leave an empty directory behind.
-  Delete the files of one directory sequentially, or delete the directory
-  through `raw.client` when the whole subtree should go.
+  present and leave an empty directory behind. An `upload()` into a
+  directory that a concurrent `delete()` has just found empty can be removed
+  with it. Avoid mixing deletes and uploads in one directory in parallel, or
+  delete the directory through `raw.client` when the whole subtree should go.
 - Buddy serves no per-file content type or user metadata: `contentType` is
   always `application/octet-stream`, `metadata` is ignored, and
   `lastModified` is the epoch (the API returns no mtime). `etag` is the

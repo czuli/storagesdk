@@ -25,8 +25,8 @@ if (configured) {
       ...(API_URL !== undefined ? { apiUrl: API_URL } : {}),
     });
 
-  // Snapshots and forks are server-side version copies that Buddy finishes
-  // asynchronously (~10 s each); merge/rebase chain several of them.
+  // Snapshots and forks are server-side version copies; merge/rebase chain
+  // several of them, each a handful of requests against the rate limit.
   storageAdapterTestSuite({
     name: 'buddy adapter',
     skip: false,

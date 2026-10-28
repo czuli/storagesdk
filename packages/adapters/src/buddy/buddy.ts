@@ -29,24 +29,8 @@ import {
   type BuddyVersion,
   DEFAULT_API_URL,
   encodePath,
-  sleep,
 } from './client.js';
 import { asStorageError } from './errors.js';
-
-export interface BuddyCopyOptions {
-  /**
-   * First wait before checking whether a version copy (snapshot / fork)
-   * has landed, in milliseconds. Each further wait grows by `stepMs` up to
-   * `maxPollMs`. Defaults to 1000.
-   */
-  pollMs?: number;
-  /** Growth of the poll interval per tick. Defaults to 500. */
-  stepMs?: number;
-  /** Longest wait between two polls. Defaults to 3000. */
-  maxPollMs?: number;
-  /** Give up on a copy after this long. Defaults to 600 000 (10 min). */
-  timeoutMs?: number;
-}
 
 export interface BuddyConfig {
   /** Workspace domain, e.g. `my-team` from `app.buddy.works/my-team`. */
@@ -77,8 +61,6 @@ export interface BuddyConfig {
    * honoured up to 30 s) suit the 3000 requests/hour token limit.
    */
   retry?: BuddyRetryOptions;
-  /** Polling policy for server-side version copies (snapshots and forks). */
-  copy?: BuddyCopyOptions;
 }
 
 /** Escape hatch: the authenticated REST client plus resolved identifiers. */
@@ -92,20 +74,6 @@ export interface BuddyRaw {
 const DEFAULT_VERSION = 'live';
 const DEFAULT_CONTENT_TYPE = 'application/octet-stream';
 
-/**
- * Version-copy polling defaults. A snapshot of a few MB lands in roughly
- * 8–10 s and a fork made directly from the live tree (two copies) in
- * about 20 s; the interval starts short to catch quick copies and grows
- * so long ones cost fewer requests against the hourly token limit.
- */
-const COPY_POLL_MS = 1000;
-const COPY_POLL_STEP_MS = 500;
-const COPY_POLL_MAX_MS = 3000;
-/** Every N polls, fall back to comparing source/destination sizes. */
-const COPY_SIZE_CHECK_EVERY = 3;
-/** Give up waiting for a version copy after this long. */
-const COPY_TIMEOUT_MS = 10 * 60 * 1000;
-
 const VERSIONS_PER_PAGE = 100;
 
 /**
@@ -116,7 +84,6 @@ const VERSIONS_PER_PAGE = 100;
 interface Context {
   client: BuddyClient;
   config: BuddyConfig;
-  copy: Required<BuddyCopyOptions>;
   artifactId: Promise<string> | undefined;
   versionIds: Map<string, string>;
 }
@@ -158,12 +125,6 @@ export function buddy(config: BuddyConfig): Adapter<BuddyRaw> {
       config.retry ?? {}
     ),
     config,
-    copy: {
-      pollMs: config.copy?.pollMs ?? COPY_POLL_MS,
-      stepMs: config.copy?.stepMs ?? COPY_POLL_STEP_MS,
-      maxPollMs: config.copy?.maxPollMs ?? COPY_POLL_MAX_MS,
-      timeoutMs: config.copy?.timeoutMs ?? COPY_TIMEOUT_MS,
-    },
     artifactId: undefined,
     versionIds: new Map(),
   };
@@ -300,23 +261,6 @@ async function listVersions(
   return all;
 }
 
-async function getVersion(
-  ctx: Context,
-  id: string,
-  signal?: AbortSignal
-): Promise<BuddyVersion> {
-  const artifactId = await resolveArtifactId(ctx);
-  try {
-    return await ctx.client.json<BuddyVersion>(
-      'GET',
-      `/artifacts/${artifactId}/versions/${id}`,
-      signal ? { signal } : {}
-    );
-  } catch (err) {
-    throw asStorageError(err);
-  }
-}
-
 /**
  * Version name → id. Names are the stable handle (snapshot ids and fork
  * names map to version names); Buddy addresses versions by hash id only.
@@ -412,12 +356,10 @@ async function listDirectory(
 }
 
 /**
- * Create version `name` as a server-side copy of version `from` and wait
- * until the copy has landed. Buddy answers the POST immediately with an
- * empty version and fills it in the background; completion shows up as a
- * bumped `created_date`. As a safety net — e.g. a copy that finishes within
- * the same second — every few polls the destination's reported size is
- * compared with the source's.
+ * Create version `name` as a server-side copy of version `from`. Buddy
+ * completes the copy before answering the POST, so the new version is
+ * readable as soon as this resolves. Its reported `size` is filled in
+ * asynchronously a few seconds later and is not used here.
  */
 async function copyVersion(
   ctx: Context,
@@ -426,8 +368,8 @@ async function copyVersion(
   signal?: AbortSignal
 ): Promise<BuddyVersion> {
   const artifactId = await resolveArtifactId(ctx);
-  const fromId = await resolveVersionId(ctx, from, signal ? { signal } : {});
-  const source = await getVersion(ctx, fromId, signal);
+  // Fail with NotFound for a missing source instead of Buddy's 400.
+  await resolveVersionId(ctx, from, signal ? { signal } : {});
   let created: BuddyVersion;
   try {
     created = await ctx.client.json<BuddyVersion>(
@@ -439,27 +381,7 @@ async function copyVersion(
     throw asStorageError(err);
   }
   ctx.versionIds.set(name, created.id);
-
-  const { pollMs, stepMs, maxPollMs, timeoutMs } = ctx.copy;
-  const startedAt = Date.now();
-  for (let tick = 1; ; tick++) {
-    await sleep(Math.min(maxPollMs, pollMs + (tick - 1) * stepMs), signal);
-    const now = await getVersion(ctx, created.id, signal);
-    if (now.created_date !== created.created_date) return now;
-    if (
-      tick % COPY_SIZE_CHECK_EVERY === 0 &&
-      source.size > 0 &&
-      now.size === source.size
-    ) {
-      return now;
-    }
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new StorageError({
-        code: 'Provider',
-        message: `buddy: copying version ${from} to ${name} did not finish within ${Math.round(timeoutMs / 1000)}s`,
-      });
-    }
-  }
+  return created;
 }
 
 /**
@@ -681,13 +603,10 @@ function impl(
       const id = await versionId(signal);
       // `DELETE .../content/<dir>` removes a whole subtree, so only issue
       // it once the path is known to be a file. Missing paths are no-ops.
-      const parent = dirname(path);
-      const siblings = await listDirectory(ctx, id, parent, signal);
-      const entry = siblings.find(
-        (sibling) =>
-          sibling.type === 'FILE' && fromApiPath(sibling.path) === path
-      );
-      if (!entry) return;
+      // The file itself is checked, not the parent listing: under parallel
+      // writes Buddy fails directory listings with a 400 now and then,
+      // while per-file lookups keep working.
+      if (!(await headEntry(path, signal))) return;
       const removeContent = async (target: string): Promise<void> => {
         const url = await contentUrl('content', target, signal);
         try {
@@ -697,19 +616,21 @@ function impl(
           if (mapped.code !== 'NotFound') throw mapped;
         }
       };
+      await removeContent(path);
       // Buddy keeps a directory after its last file is removed, and every
-      // directory costs `list()` one request. Remove the file together with
-      // its directory when it is the only entry, then prune emptied
-      // ancestors so the tree stays as small as the objects in it.
-      if (parent === '' || siblings.length > 1) {
-        await removeContent(path);
-        return;
-      }
-      await removeContent(parent);
-      for (let dir = dirname(parent); dir !== ''; dir = dirname(dir)) {
+      // directory costs `list()` one request. Prune emptied ancestors so the
+      // tree stays as small as the objects in it. The file is gone already,
+      // so a failed listing only leaves an empty directory behind.
+      for (let dir = dirname(path); dir !== ''; dir = dirname(dir)) {
         checkSignal(signal);
-        const entries = await listDirectory(ctx, id, dir, signal);
-        if (entries.length > 0) break;
+        let entries: BuddyEntry[];
+        try {
+          entries = await listDirectory(ctx, id, dir, signal);
+        } catch (err) {
+          if (asStorageError(err).code === 'Aborted') throw err;
+          return;
+        }
+        if (entries.length > 0) return;
         await removeContent(dir);
       }
     },

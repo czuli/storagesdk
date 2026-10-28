@@ -33,7 +33,6 @@ buddy({
   version?: string;    // version that holds the live tree; defaults to 'live'
   apiUrl?: string;     // defaults to https://api.buddy.works; EU: https://api.eu.buddy.works
   retry?: { maxAttempts?: number; baseMs?: number; maxDelayMs?: number };
-  copy?: { pollMs?: number; stepMs?: number; maxPollMs?: number; timeoutMs?: number };
 });
 ```
 
@@ -41,9 +40,9 @@ Create a bucket-type artifact in the Buddy app or via the REST API and point the
 
 ## Notes
 
-- Snapshots and forks are server-side copies of the live version. Buddy performs the copy in the background and the adapter polls until it has landed (several seconds per copy; a fork made without `fromSnapshot` costs two copies).
+- Snapshots and forks are server-side copies of the live version. Buddy completes the copy before answering, so a snapshot or fork is readable as soon as the call returns (a fork made without `fromSnapshot` costs two copies).
 - The API allows 3000 requests per hour per token, reads included. `429` and `502`–`504` are retried with exponential backoff honouring `Retry-After`; `retry` tunes this.
-- `list()` costs one request per directory and `delete()` two (the parent is listed so the adapter never deletes a directory by mistake). Buddy keeps a directory after its last file is removed, so the adapter deletes the directory with its last file; two concurrent deletes of the last two files in one directory can leave an empty directory behind.
+- `list()` costs one request per directory and `delete()` two (the path is looked up first so the adapter never deletes a directory by mistake). Buddy keeps a directory after its last file is removed, so the adapter then prunes emptied directories, one listing per level; two concurrent deletes of the last two files in one directory can leave an empty directory behind, and an upload racing such a delete in the same directory can be removed with it.
 - Buddy serves no per-file content type, mtime or user metadata: `contentType` is always `application/octet-stream`, `lastModified` is the epoch and `etag` is the file's `sha256:` checksum.
 - Ranged downloads are emulated client-side; `copy()` and `move()` download and re-upload; `url()` returns the token-protected REST download endpoint and `uploadUrl()` throws `NotSupported`.
 - `storage.raw` exposes the authenticated REST client plus the resolved workspace, artifact and version names.
